@@ -1,193 +1,148 @@
 # Backend Logic Reference
 
-The core algorithms behind the Excel comparison, documented module by
-module in the order a request actually flows through them. For API routes
-and setup, see `README.md` — this file is about *how* the comparison
-itself works.
-
-```
-upload ──▶ parse & cache ──▶ resolve tag column ──▶ diff ──▶ cache result ──▶ report
- (workbooks.py)  (excel_utils.py)   (tag_detection.py)  (compare.py)  (storage.py)  (report.py)
-```
+The core algorithms behind the Excel comparison, explained module by
+module in the order a request actually flows through them: upload and
+parse, resolve the tag column, diff, cache the result, then render a
+report. For routes and setup, see `README.md` — this file is about how the
+comparison itself works.
 
 ---
 
-## 1. Tag column detection — `app/tag_detection.py`
+## 1. Tag column detection (`app/tag_detection.py`)
 
-Headers are normalized to just their letters/digits, upper-cased, so
-formatting never causes a false mismatch:
+Every header is normalized before it's compared: converted to upper case
+and stripped down to just its letters and digits. This means "Tag No.",
+"TAG_NO", and "tag no" are all treated as identical, regardless of
+punctuation, spacing, or underscores. A fixed list of known aliases
+("Tag Number", "Tag No", "Instrument Tag", "Equipment Tag", "Asset Tag",
+and a handful of others) is normalized the same way once, up front.
 
-```python
-def normalize_header(header: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", header.upper())
-```
-
-`"Tag No."`, `"TAG_NO"`, and `"tag no"` all normalize to `"TAGNO"`. A fixed
-list of known aliases (`TAG NUMBER`, `TAG NO`, `INSTRUMENT TAG`,
-`EQUIPMENT TAG`, `ASSET TAG`, …) is normalized the same way once, at import
-time.
-
-```python
-def resolve_tag_column(columns: list[str], requested: str) -> str:
-    if requested in columns:
-        return requested                         # exact match wins
-
-    detection = detect_tag_column(columns)
-    if detection.detected:
-        return detection.detected                # exactly one alias match
-    if detection.is_ambiguous:
-        raise AmbiguousTagColumnError(detection.candidates)
-    raise TagColumnNotFoundError(...)
-```
-
-The frontend always sends the literal string `"Tag Number"` as `requested`.
-If a sheet's real header is something else (`"Tag No."`, `"Instrument Tag"`),
-this still resolves it — **without the user renaming anything**. Each
-worksheet is resolved independently, so the original and revised sheet can
-even use different aliases for the same concept.
+Resolving the tag column for a sheet works in three steps, tried in order:
+first, if the requested name (the frontend always asks for "Tag Number")
+appears literally among the sheet's headers, it's used as-is — this is the
+common case. Second, if no literal match exists, the normalized headers are
+checked against the alias list; if exactly one column matches an alias,
+that column is used instead. Third, if more than one column matches an
+alias, the sheet is ambiguous and detection refuses to guess, raising an
+error that names the candidates so the caller can ask the user to confirm.
+If nothing matches at all, a different error says no tag column could be
+found. Each worksheet is resolved independently, so the original and
+revised sheet are even allowed to use different header spellings for the
+same underlying concept.
 
 ---
 
-## 2. Parsing — `app/excel_utils.py`
+## 2. Parsing (`app/excel_utils.py`)
 
-`parse_sheet()` turns one worksheet into a `ParsedSheet`:
+A worksheet is read into a small in-memory structure: a list of its unique
+column headers in file order, a list of any header names that appeared
+more than once (a data-quality problem reported later, not silently
+ignored), and a list of data rows. Each row keeps its original spreadsheet
+row number — so later output can point back to exactly where a value came
+from — alongside its values as a mapping from header name to cell value.
 
-```python
-@dataclass
-class SheetRow:
-    row_number: int          # real spreadsheet row, for traceability
-    values: dict[str, Any]   # header -> raw cell value (native type)
+Row one is always treated as the header row; blank header cells are
+skipped. A header that repeats is recorded as a duplicate, and when that
+happens, the last occurrence of that column is the one used for its
+values — but the duplication itself is still flagged. Fully blank data rows
+are skipped entirely rather than being treated as empty records.
 
-@dataclass
-class ParsedSheet:
-    columns: list[str]           # unique headers, in file order
-    duplicate_headers: list[str] # data-quality issue, reported later
-    rows: list[SheetRow]
-```
-
-Key decisions:
-- **Row 1 is always the header row.** Blank header cells are skipped;
-  a header seen twice is recorded in `duplicate_headers` (last occurrence
-  wins for value lookup, but the duplicate itself is reported as an error).
-- **Fully blank data rows are skipped** (`all(cell.value in (None, ""))`).
-- **Cell values keep their native Python type** (`int`/`float`/`str`/
-  `bool`/`datetime`/`None`) — nothing is stringified yet. This is what lets
-  later comparisons be exact, with no rounding.
-
-`display_value()` only runs at the very end, to turn a raw value into the
-string the API/report actually show (`None` and blank strings → `None`;
-whole floats → `"5"` not `"5.0"`; dates → ISO format).
+Critically, cell values keep their original type — numbers stay numbers,
+dates stay dates, text stays text — nothing is converted to a string at
+this stage. That's what allows later value comparisons to be exact, with no
+rounding or implicit type coercion. Converting a value into its final
+display string only happens afterward, right before it's shown: a blank or
+whitespace-only string and a genuinely empty cell are both treated as
+"blank"; a whole-number float displays without a trailing ".0"; dates
+display in ISO format.
 
 ---
 
-## 3. The diff engine — `app/compare.py`
+## 3. The diff engine (`app/compare.py`)
 
-Pure function: `compare_sheets(original, revised, config) -> ComparisonResult`.
-No I/O, no FastAPI types — just data in, data out. Four stages:
+This is the heart of the system: a single function that takes the parsed
+original sheet, the parsed revised sheet, and the comparison options, and
+produces a complete result. It has no awareness of HTTP, files, or storage
+— it only works with the data already parsed in memory, which makes its
+behavior easy to reason about and test in isolation.
 
-**a. Resolve each sheet's tag column independently:**
-```python
-original_tag_column = resolve_tag_column(original.columns, config.tagColumn)
-revised_tag_column = resolve_tag_column(revised.columns, config.tagColumn)
-```
+It proceeds in four stages. First, it resolves the actual tag column for
+each sheet independently, exactly as described above. Second, it looks at
+which columns exist in only one of the two sheets (ignoring the tag column
+and anything the user explicitly chose to ignore) and records each such
+column as a validation error — the comparison doesn't stop, but the user is
+told a column is missing on one side. Duplicate headers detected during
+parsing are reported the same way.
 
-**b. Flag column-level problems** that aren't tied to any one row —
-a column present in only one sheet, or a duplicate header — each becomes
-an `error`-type `DifferenceRow` with `tagNumber=""`.
+Third, it builds a lookup from tag value to row, separately for each
+sheet. While doing so, it watches for two kinds of trouble: a tag value
+that's blank, and a tag value that appears more than once. Both are
+recorded as validation errors — naming the affected row numbers — and both
+are excluded from the rest of the comparison, since there's no reliable
+single row to compare for them.
 
-**c. Build a `tag -> row` map per sheet**, flagging data-quality issues as
-they're found instead of silently dropping anything:
-```python
-if tag in tag_map:
-    duplicate_rows[tag].append(row.row_number)   # reported as an error row, excluded below
-elif tag is None or tag == "":
-    blank_rows.append(row.row_number)             # reported as an error row, skipped
-else:
-    tag_map[tag] = row
-```
+Fourth, it walks every remaining tag that appears in either sheet. A tag
+present only in the revised sheet is reported as added; a tag present only
+in the original sheet is reported as removed. A tag present in both is
+compared column by column, for every column shared by both sheets: if a
+value differs, that's reported as a changed value, naming the column and
+both the original and revised value. If nothing differs across any shared
+column for a tag, it's simply counted as unchanged — no row is produced
+for it.
 
-**d. Walk every tag** (`original_map.keys() | revised_map.keys()`, minus
-duplicates) and classify it:
-
-| Case | Result |
-|---|---|
-| only in revised | `added` |
-| only in original | `removed` |
-| in both, some shared column differs | `changed` (one row *per differing column*) |
-| in both, nothing differs | counted in `unchangedCount`, no row emitted |
-
-Value comparison is **exact by construction** — numbers/dates/booleans are
-compared with Python's native `!=`, never rounded or coerced:
-```python
-def _normalize_for_compare(value, trim_whitespace, ignore_case):
-    if value is None:
-        return None
-    if isinstance(value, str):          # options only ever touch strings
-        ...
-        return text
-    return value                        # numbers/dates/bools: compared as-is
-```
-
-Everything accumulates into one `ComparisonSummary` (counts) and a sorted
-list of `DifferenceRow`s.
+The value comparison itself is exact by construction. Text values can
+optionally be trimmed of extra whitespace and/or compared case-insensitively,
+depending on the options chosen — but numbers, dates, and true/false values
+are never touched by those options; they're always compared exactly as
+stored, with no rounding and no type coercion. Everything the engine finds
+is tallied into a set of summary counts and returned alongside the full,
+sorted list of differences.
 
 ---
 
-## 4. Report rendering — `app/report.py`
+## 4. Report rendering (`app/report.py`)
 
-Writes the downloadable `.xlsx` (Summary + Differences sheets) from the
-same `ComparisonResult` the API returns. One presentation rule lives here,
-deliberately kept out of the engine above:
-
-```python
-def _display_difference(diff: DifferenceRow) -> tuple[str, str, str]:
-    if diff.changeType.value == "added":
-        return "Added Tag", "", ""
-    if diff.changeType.value == "removed":
-        return "Removed Tag", "", ""
-    return diff.columnName, diff.originalValue or "", diff.revisedValue or ""
-```
-
-The engine represents an added/removed tag by reusing the tag column name
-with the tag ID as the value (accurate, but redundant next to the row's own
-Tag Number cell). This function relabels it for display only — the engine's
-actual `DifferenceRow` data is untouched. The frontend has the identical
-mapping (`frontend/src/utils/differenceDisplay.ts`), so the UI table and
-this report always agree.
+The downloadable spreadsheet is built directly from the same result the
+API returns, with one deliberate presentation adjustment kept entirely out
+of the engine above: the engine represents an added or removed tag by
+reusing the tag column's name together with the tag ID as its value, which
+is accurate but reads as redundant next to the tag number already shown in
+its own column. For display and for the report only, an added tag is
+relabeled as "Added Tag" and a removed tag as "Removed Tag", with their
+value cells left blank, since the tag ID is already visible elsewhere in
+the same row. Every other kind of row — changed values and validation
+errors — is shown exactly as the engine produced it. This relabeling is
+purely cosmetic: the underlying result object handed back by the API is
+never altered, and the frontend applies the identical relabeling so the
+on-screen table and the downloaded report always agree.
 
 ---
 
-## 5. Storage — `app/storage.py` + `app/dependencies.py`
+## 5. Storage (`app/storage.py` and `app/dependencies.py`)
 
-No database. `_BoundedStore` is a `dict` + a `threading.Lock`, capped at
-`N` items (default 50) with oldest-first eviction:
-```python
-def put(self, key, value):
-    with self._lock:
-        self._items[key] = value
-        while len(self._items) > self._max_items:
-            del self._items[next(iter(self._items))]   # dict preserves insertion order
-```
-Two singletons — `workbook_store` (parsed `openpyxl.Workbook` objects) and
-`comparison_store` (`ComparisonResult`s, so the report endpoint can re-fetch
-by id). `dependencies.get_stored_workbook()` is the one shared "look it up
-or raise 404" helper both routers use, so that error is handled identically
-everywhere instead of being duplicated.
+There is no database. Uploaded workbooks and comparison results are kept
+in two simple in-memory stores for the lifetime of the running process,
+each capped at a fixed number of entries; once that cap is reached, the
+oldest entry is discarded to make room for the newest. One small shared
+helper is responsible for looking up a stored workbook by its id and
+producing a clear "not found" error if it's missing or has since been
+evicted — every route that needs a workbook goes through that same helper,
+so that failure is handled identically everywhere rather than being
+reimplemented per route.
 
 ---
 
 ## Design choices worth knowing
 
-- **Config is a hint, not a guarantee.** `config.tagColumn` is whatever the
-  caller asked for; the actual column used is always *resolved*, per sheet,
-  at compare time. Nothing upstream needs to know a sheet's real header.
-- **Row matching is by tag, not position.** Column order and row order
-  never matter — only the header name and the tag value do.
-- **Errors are data, not exceptions, once inside the diff.** A duplicate
-  tag or a missing column doesn't abort the comparison — it becomes an
-  `error`-type `DifferenceRow` alongside everything else. Only a genuinely
-  unresolvable tag column (`TagColumnNotFoundError`/`AmbiguousTagColumnError`)
-  aborts the whole run, surfaced as HTTP `422`.
-- **Nothing persists.** Uploaded files live on disk only for the few
-  milliseconds `openpyxl` needs to read them; everything else is in-process
-  memory, gone on restart.
+The requested tag column name is always treated as a hint, never a
+guarantee — the column actually used is resolved fresh, per sheet, at
+comparison time, so nothing upstream needs to know a sheet's real header
+in advance. Rows are matched purely by tag value, never by position, so
+column order and row order never matter. Most problems discovered during a
+comparison — a duplicate tag, a missing column, a blank identifier — are
+treated as data to report, not as reasons to abort; the comparison still
+completes and the issue is simply listed alongside everything else. Only a
+tag column that genuinely can't be resolved stops the comparison outright.
+Finally, nothing is persisted: an uploaded file touches disk only for the
+brief moment it takes to read it into memory, and every other piece of
+state disappears the moment the process restarts.
