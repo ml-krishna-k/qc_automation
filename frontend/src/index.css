@@ -16,14 +16,20 @@
   --color-ink-soft: #4a554f;
   --color-ink-faint: #7b847e;
 
-  /* Brand */
-  --color-brand-900: #0f2b26;
-  --color-brand-800: #14342e;
-  --color-brand-700: #1d4a41;
-  --color-brand-500: #2f8a73;
-  --color-brand-300: #5fd0a8;
-  --color-brand-100: #d7efe5;
-  --color-brand-50: #eaf6f0;
+  /* Brand — Arsène green */
+  --color-brand-900: #052b12;
+  --color-brand-800: #0b3b1c;
+  --color-brand-700: #124f27;
+  --color-brand-600: #1a6b35;
+  --color-brand-500: #228c3f;
+  --color-brand-300: #7fd18f;
+  --color-brand-100: #dcf3df;
+  --color-brand-50: #f0faf1;
+
+  /* Accent — Arsène yellow */
+  --color-accent: #ffd101;
+  --color-accent-dark: #e6bc00;
+  --color-accent-soft: #fff3c2;
 
   /* Semantic change types */
   --color-changed: #9a5b00;
